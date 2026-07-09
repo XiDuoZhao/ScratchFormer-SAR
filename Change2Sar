@@ -1,0 +1,200 @@
+ScratchFormer 适配单极化 SAR 变化检测说明
+
+一、改动目标
+将原始面向三通道光学遥感图像的变化检测代码，改造成可直接用于单极化 SAR 单通道变化检测的版本，同时尽量保持原始 RGB 训练流程不受影响。
+
+二、改动文件与目的
+
+1. datasets/data_utils.py
+改动内容：
+- 将图像归一化从固定三通道 `mean=[0.5, 0.5, 0.5]`、`std=[0.5, 0.5, 0.5]` 改为根据输入图像的实际通道数自动生成。
+- 为 `random_color_tf` 增加中文说明，明确 SAR 数据通常不使用颜色扰动。
+
+改动目的：
+- 原代码默认输入为 RGB 图像，若直接输入单通道 SAR，会在归一化阶段因通道数不匹配报错。
+- SAR 是灰度散射强度图，颜色增强不符合其物理含义，可能破坏统计分布。
+
+2. datasets/CD_dataset.py
+改动内容：
+- 为 `ImageDataset` 和 `CDDataset` 增加 `img_mode` 参数。
+- 读图时不再固定 `convert('RGB')`，改为 `convert(self.img_mode)`。
+- 为训练阶段的颜色增强开关 `random_color_tf` 增加可配置支持。
+
+改动目的：
+- 让同一套数据读取代码同时兼容光学 RGB 和单极化 SAR 单通道图像。
+- 避免把单通道 SAR 强制扩成伪 RGB，从而引入不必要的冗余通道。
+
+3. utils.py
+改动内容：
+- `get_loader()` 增加 `img_mode` 参数，并传递给 `CDDataset`。
+- `get_loaders()` 从 `args` 中读取 `img_mode`。
+- 仅在 `img_mode == 'RGB'` 且处于训练阶段时开启颜色扰动。
+- 验证阶段关闭颜色扰动。
+
+改动目的：
+- 将数据模式控制从命令行参数贯通到数据集实例。
+- 保证 SAR 训练和评估流程不会误用 RGB 特有的数据增强。
+
+4. models/networks.py
+改动内容：
+- `define_G()` 创建 `ScratchFormer` 时，显式传入 `input_nc=args.input_nc` 和 `output_nc=args.n_class`。
+
+改动目的：
+- 支持将模型输入通道数从原始 3 通道改为 1 通道。
+- 保证模型结构与单极化 SAR 输入一致。
+
+5. main_cd.py
+改动内容：
+- 新增参数 `--img_mode`，默认值为 `RGB`。
+- 新增参数 `--input_nc`，默认值为 `3`。
+- 在测试数据加载时，将 `img_mode` 传入 `utils.get_loader()`。
+
+改动目的：
+- 允许通过命令行切换光学图像模式和单极化 SAR 模式。
+- 保证训练完成后自动测试时也使用正确的单通道读图方式。
+
+6. eval_cd.py
+改动内容：
+- 新增参数 `--img_mode`，默认值为 `RGB`。
+- 新增参数 `--input_nc`，默认值为 `3`。
+- 在评估数据加载时，将 `img_mode` 传入 `utils.get_loader()`。
+
+改动目的：
+- 保证评估阶段与训练阶段的数据通道配置一致。
+- 支持对单极化 SAR 模型进行单独推理和测试。
+
+三、当前使用方式
+
+1. 单极化 SAR 训练
+python main_cd.py --data_name YOUR_DATA --img_mode L --input_nc 1 --n_class 2
+
+2. 单极化 SAR 评估
+python eval_cd.py --data_name YOUR_DATA --img_mode L --input_nc 1 --n_class 2
+
+四、参数含义
+
+1. img_mode
+- `RGB`：适用于原始三通道光学遥感图像。
+- `L`：适用于单通道灰度图，单极化 SAR 推荐使用该模式。
+
+2. input_nc
+- 表示每个时相输入图像的通道数。
+- 光学图像通常为 `3`。
+- 单极化 SAR 通常为 `1`。
+
+五、这次改动的原则
+
+1. 尽量少改原始框架
+- 主要只修改输入通道、数据读取方式和增强开关。
+- 不直接改动 ScratchFormer 主体结构，便于后续和原论文基线做对比。
+
+2. 保持向后兼容
+- 默认参数仍是 `RGB` 和 `3` 通道，因此原始光学变化检测流程仍可继续使用。
+
+3. 先解决“能用”，再做“更优”
+- 当前改动已经让该项目可以直接接入单极化 SAR。
+- 后续若要进一步提升性能，可以继续增加：
+  a. SAR 专用预处理，如对数变换、dB 变换、分位数截断归一化。
+  b. SAR 专用增强，如 speckle 噪声增强。
+  c. 面向小目标与碎边界的损失函数或后处理。
+
+六、后续建议
+
+1. 先用当前版本跑通单极化 SAR 数据集，确认数据读取、训练、评估链路无误。
+2. 如果数据是 `.tif` 或浮点强度图，建议再增加专门的数据读取与归一化逻辑。
+3. 如果效果不稳定，优先从数据预处理入手，而不是先大改主模型结构。
+
+七、新增实验版本：SAR-MoE
+
+为了在小论文中形成“基线模型 + 改进模型 + 消融实验”的完整叙事，本次在 baseline 基础上新增了一个可切换的 SAR-MoE 版本。
+
+1. 改动位置
+- `models/scratch_former.py`
+- `models/networks.py`
+- `main_cd.py`
+- `eval_cd.py`
+- `utils.py`
+
+2. 具体设计
+- 在输入端新增 `SARMoEBlock`，对每个时相图像做轻量级自适应增强。
+- 在解码器四个尺度的 CEFF 输出后，各加入一个 `SARMoEBlock`。
+- 在多尺度最终融合特征后，再加入一个 `SARMoEBlock`。
+
+3. 设计动机
+- 单极化 SAR 图像存在明显 speckle 噪声，且纹理模式与光学图像不同。
+- 单一卷积核难以同时兼顾局部细节、斑点扰动和较大范围上下文。
+- MoE 可以通过门控机制，在多个不同感受野专家之间自适应分配权重，更适合 SAR 变化检测。
+
+4. 当前实现的专家结构
+- 3x3 深度可分离卷积专家：偏向局部细节建模。
+- 5x5 深度可分离卷积专家：偏向更平滑的局部上下文。
+- 膨胀 3x3 深度可分离卷积专家：偏向较大感受野的上下文建模。
+
+5. 门控方式
+- 先对输入特征做全局平均池化。
+- 再通过两层 1x1 卷积生成各专家权重。
+- 使用 softmax 归一化后，对多个专家输出进行加权求和。
+
+6. 命令行开关
+- `--use_moe`：开启 SAR-MoE 改进版。
+- `--data_root`：直接指定数据集根目录，方便切换不同 SAR 数据集而不改源码。
+
+7. 使用方式
+
+baseline：
+`python main_cd.py --data_name YOUR_DATA --data_root YOUR_ROOT --img_mode L --input_nc 1 --n_class 2`
+
+SAR-MoE：
+`python main_cd.py --data_name YOUR_DATA --data_root YOUR_ROOT --img_mode L --input_nc 1 --n_class 2 --use_moe`
+
+评估：
+`python eval_cd.py --data_name YOUR_DATA --data_root YOUR_ROOT --img_mode L --input_nc 1 --n_class 2 --use_moe`
+
+八、建议的小论文实验组织方式
+
+1. 基线实验
+- ScratchFormer-SAR baseline
+- 即当前仅做单通道 SAR 适配、不启用 `--use_moe` 的版本
+
+2. 主实验
+- ScratchFormer-SAR + MoE
+- 即启用 `--use_moe` 的版本
+
+3. 消融实验建议
+- Baseline
+- Baseline + 输入端 MoE
+- Baseline + 解码端多尺度 MoE
+- Baseline + 输入端 MoE + 解码端多尺度 MoE
+
+4. 对比实验建议
+- 对比原始 baseline 与改进版的 `F1`、`mIoU`、`Precision`、`Recall`
+- 如果你的数据集变化区域较小，建议额外统计变化类 `F1_1` 和 `iou_1`
+
+九、下一步仍值得继续增强的方向
+
+1. SAR 专用预处理
+- 对数变换
+- dB 变换
+- 分位数裁剪归一化
+
+2. SAR 专用增强
+- speckle 噪声增强
+- 随机局部对比度扰动
+
+3. 损失函数增强
+- `ce + dice`
+- `focal + iou`
+- 面向变化类不平衡的加权损失
+
+4. 结果后处理
+- 小连通域去噪
+- CRF 或形态学后处理
+
+十、当前版本的定位
+
+当前版本已经具备以下能力：
+- 可以作为单极化 SAR 变化检测 baseline 直接运行。
+- 可以通过 `--use_moe` 切换到改进版模型。
+- 可以通过 `--data_root` 快速适配不同数据集目录。
+
+因此，这一版已经适合作为你后续小论文实验框架的起点。
