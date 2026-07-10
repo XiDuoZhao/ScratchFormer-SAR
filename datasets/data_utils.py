@@ -70,11 +70,10 @@ class CDDataAugmentation:
 
         labels = [TF.to_pil_image(img) for img in labels]
         
-        if not self.is_evaluation:
-            if len(labels) != 0:
-                if labels[0].size != (self.img_size, self.img_size):
-                    labels = [TF.resize(img, [self.img_size, self.img_size], interpolation=0)
-                            for img in labels]
+        if len(labels) != 0:
+            if labels[0].size != (self.img_size, self.img_size):
+                labels = [TF.resize(img, [self.img_size, self.img_size], interpolation=0)
+                        for img in labels]
 
         random_base = 0.5
         if self.with_random_hflip and random.random() > 0.5:
@@ -137,7 +136,7 @@ class CDDataAugmentation:
                             color_jitter.hue)
                 imgs_tf.append(tf(img))
             imgs = imgs_tf
-            
+
         if to_tensor:
             # to tensor
             imgs = [TF.to_tensor(img) for img in imgs]

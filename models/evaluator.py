@@ -78,9 +78,10 @@ class CDEvaluator():
             keys = list(state_dict.keys())
             state_dict_new = OrderedDict()
             
-            # remove module keyword from statedict keys
+            # DataParallel checkpoints prefix every parameter with "module.".
+            # Single-GPU checkpoints do not have that prefix and must be kept intact.
             for key in keys:
-                key_new = key[7:]
+                key_new = key[7:] if key.startswith('module.') else key
                 state_dict_new[key_new] = state_dict[key]
             
             del checkpoint['model_G_state_dict']
