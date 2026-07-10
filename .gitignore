@@ -8,4 +8,5 @@ Logs/
 *.pth
 *.npy
 *.pdf
+.conda/
 datasets/CD/
