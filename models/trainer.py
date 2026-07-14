@@ -249,7 +249,12 @@ class CDTrainer():
                 w, h = vis_gt.shape[1], vis_gt.shape[0]
                 vis_pred = cv2.resize(vis_pred, (w, h), interpolation = cv2.INTER_NEAREST)
             
-            vis = np.concatenate([vis_input, vis_input2, vis_pred, vis_gt], axis=0)
+            vis = utils.stack_labeled_visualizations([
+                ('Time 1 image (A)', vis_input),
+                ('Time 2 image (B)', vis_input2),
+                ('Prediction (Pred)', vis_pred),
+                ('Ground truth (GT)', vis_gt),
+            ])
             vis = np.clip(vis, a_min=0.0, a_max=1.0)
             file_name = os.path.join(
                 self.vis_dir, 'istrain_'+str(self.is_training)+'_'+

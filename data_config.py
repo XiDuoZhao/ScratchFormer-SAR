@@ -13,7 +13,7 @@ class DataConfig:
             self.root_dir =  '../dataset/CD/DSIFN-CD-256/'
         elif data_name == 'WHU':
             self.label_transform = "norm"
-            self.root_dir = '../dataset/CD/WHU-CD-256/'
+            self.root_dir = './datasets/CD/WHU-CD-256-patches/'
         elif data_name == 'SYSU':
             self.label_transform = "norm"
             self.root_dir = '../dataset/CD/SYSU-CD-256/'
