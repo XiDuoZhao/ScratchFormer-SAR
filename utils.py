@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torchvision import utils
+import cv2
 
 import data_config
 from datasets.CD_dataset import CDDataset
@@ -86,6 +87,21 @@ def make_numpy_grid(tensor_data, pad_value=0,padding=0):
     if vis.shape[2] == 1:
         vis = np.stack([vis, vis, vis], axis=-1)
     return vis
+
+
+def stack_labeled_visualizations(panels):
+    """Stack visualizations with a title bar identifying each panel."""
+    title_height = 32
+    labeled_panels = []
+    for title, panel in panels:
+        panel = np.asarray(panel)
+        if panel.ndim == 2:
+            panel = np.repeat(panel[..., None], 3, axis=2)
+        title_bar = np.full((title_height, panel.shape[1], 3), 0.08, dtype=np.float32)
+        cv2.putText(title_bar, title, (10, 22), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65, (1.0, 1.0, 1.0), 1, cv2.LINE_AA)
+        labeled_panels.extend((title_bar, panel))
+    return np.concatenate(labeled_panels, axis=0)
 
 
 def de_norm(tensor_data):

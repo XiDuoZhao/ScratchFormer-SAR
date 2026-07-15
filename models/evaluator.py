@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 
 from models.networks import *
 from misc.metric_tool import ConfuseMatrixMeter
+from misc.scene_evaluation import SceneStitchEvaluator
 from misc.logger_tool import Logger
 from utils import de_norm
 import utils
@@ -59,6 +60,28 @@ class CDEvaluator():
         self.epoch_id = 0
         self.checkpoint_dir = args.checkpoint_dir
         self.vis_dir = args.vis_dir
+
+        self.scene_evaluator = None
+        if getattr(args, 'scene_eval', False):
+            metadata_path = getattr(args, 'scene_metadata', '')
+            if not metadata_path:
+                if not args.data_root:
+                    raise ValueError(
+                        'scene evaluation requires --data_root or --scene_metadata'
+                    )
+                metadata_path = os.path.join(args.data_root, 'metadata.csv')
+            output_dir = getattr(args, 'scene_eval_output', '')
+            if not output_dir:
+                output_dir = os.path.join(self.checkpoint_dir, 'scene_evaluation')
+            self.scene_evaluator = SceneStitchEvaluator(
+                metadata_path=metadata_path,
+                output_dir=output_dir,
+                n_class=self.n_class,
+            )
+            self.logger.write(
+                '已启用完整场景评估，坐标元数据: %s\n' % metadata_path
+            )
+            self.logger.write('完整场景结果目录: %s\n' % output_dir)
 
         # check and create model dir
         if os.path.exists(self.checkpoint_dir) is False:
@@ -127,6 +150,15 @@ class CDEvaluator():
 
         running_acc = self._update_metric()
 
+        if self.scene_evaluator is not None:
+            self.scene_evaluator.add_batch(
+                names=self.batch['name'],
+                logits=self.G_pred,
+                images_a=self.batch['A'],
+                images_b=self.batch['B'],
+                labels=self.batch['L'],
+            )
+
         m = len(self.dataloader)
 
         if np.mod(self.batch_id, 100) == 1:
@@ -151,7 +183,12 @@ class CDEvaluator():
             w, h = vis_gt.shape[1], vis_gt.shape[0]
             vis_pred = cv2.resize(vis_pred, (w, h), interpolation = cv2.INTER_NEAREST)
         
-        vis = np.concatenate([vis_input, vis_input2, vis_pred, vis_gt], axis=0)
+        vis = utils.stack_labeled_visualizations([
+            ('Time 1 image (A)', vis_input),
+            ('Time 2 image (B)', vis_input2),
+            ('Prediction (Pred)', vis_pred),
+            ('Ground truth (GT)', vis_gt),
+        ])
         vis = np.clip(vis, a_min=0.0, a_max=1.0)
         file_name = os.path.join(
             self.vis_dir, 'eval_' + str(self.batch_id)+'.jpg')
@@ -192,9 +229,15 @@ class CDEvaluator():
         img_in1 = batch['A'].to(self.device)
         img_in2 = batch['B'].to(self.device)
         self.G_pred = self.net_G(img_in1, img_in2)[-1]
-        
-        ### resize prediction back to original size of 256x256
-        self.G_pred = F.interpolate(self.G_pred, size=[256, 256], mode='bilinear')
+
+        target_size = batch['L'].shape[-2:]
+        if self.G_pred.shape[-2:] != target_size:
+            self.G_pred = F.interpolate(
+                self.G_pred,
+                size=target_size,
+                mode='bilinear',
+                align_corners=False,
+            )
 
     def eval_models(self,checkpoint_name='best_ckpt.pt'):
 
@@ -214,5 +257,22 @@ class CDEvaluator():
                 self._forward_pass(batch)
             self._collect_running_batch_states()
         self._collect_epoch_states()
+        if self.scene_evaluator is not None:
+            summary = self.scene_evaluator.finalize()
+            macro = summary['scene_macro_mean']
+            global_scores = summary['pixel_global']
+            self.logger.write(
+                '场景宏平均: F1=%.5f IoU=%.5f Kappa=%.5f MCC=%.5f\n'
+                % (macro['f1'], macro['iou'], macro['kappa'], macro['mcc'])
+            )
+            self.logger.write(
+                '像素汇总: F1=%.5f IoU=%.5f Kappa=%.5f MCC=%.5f\n'
+                % (
+                    global_scores['f1'],
+                    global_scores['iou'],
+                    global_scores['kappa'],
+                    global_scores['mcc'],
+                )
+            )
         total_eval_duration = time.time() - eval_start_time
         self.logger.write('本次测试总耗时: %s\n' % self._format_duration(total_eval_duration))

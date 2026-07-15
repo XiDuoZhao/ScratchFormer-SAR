@@ -23,7 +23,7 @@ def test(args):
                                   split='test', img_mode=args.img_mode, data_root=args.data_root)
     model = CDEvaluator(args=args, dataloader=dataloader)
 
-    model.eval_models()
+    model.eval_models(checkpoint_name=args.checkpoint_name)
 
 
 if __name__ == '__main__':
@@ -35,6 +35,13 @@ if __name__ == '__main__':
     parser.add_argument('--project_name', default='./scratchformer', type=str)
     parser.add_argument('--checkpoint_root', default='./checkpoints', type=str)
     parser.add_argument('--vis_root', default='./vis', type=str)
+    parser.add_argument(
+        '--mode',
+        default='train_test',
+        choices=['train', 'test', 'train_test'],
+        help='run training, testing, or both',
+    )
+    parser.add_argument('--checkpoint_name', default='best_ckpt.pt', type=str)
 
     # data
     parser.add_argument('--num_workers', default=8, type=int)
@@ -48,6 +55,23 @@ if __name__ == '__main__':
     # img_mode=RGB 对应原始光学遥感流程；img_mode=L 用于单极化 SAR 单通道输入
     parser.add_argument('--img_mode', default='RGB', type=str, help='RGB for optical images, L for single-channel SAR')
     parser.add_argument('--shuffle_AB', default=False, type=str)
+    parser.add_argument(
+        '--scene_eval',
+        action='store_true',
+        help='stitch test patches into full scenes using metadata.csv',
+    )
+    parser.add_argument(
+        '--scene_metadata',
+        default='',
+        type=str,
+        help='metadata.csv path; defaults to <data_root>/metadata.csv',
+    )
+    parser.add_argument(
+        '--scene_eval_output',
+        default='',
+        type=str,
+        help='scene evaluation output; defaults to checkpoint scene_evaluation directory',
+    )
 
     # model
     # input_nc 用于显式指定每个时相图像的通道数，单极化 SAR 应设置为 1
@@ -60,7 +84,18 @@ if __name__ == '__main__':
     parser.add_argument('--multi_scale_infer', default=False, type=bool)
     parser.add_argument('--multi_pred_weights', nargs = '+', type = float, default = [0.5, 0.5, 0.5, 0.8, 1.0])
     parser.add_argument('--net_G', default='ScratchFormer', type=str, help='ScratchFormer')
-    parser.add_argument('--loss', default='ce', type=str)
+    parser.add_argument(
+        '--loss',
+        default='ce',
+        type=str,
+        help='ce | ce_dice | bce | fl | miou | mmiou',
+    )
+    parser.add_argument(
+        '--selection_metric',
+        default='mf1',
+        type=str,
+        help='validation metric used to select best_ckpt.pt; use F1_1 for SAR',
+    )
 
     # optimizer
     parser.add_argument('--optimizer', default='adamw', type=str)
@@ -81,6 +116,7 @@ if __name__ == '__main__':
     args.vis_dir = os.path.join(args.vis_root, args.project_name)
     os.makedirs(args.vis_dir, exist_ok=True)
 
-    train(args)
-
-    test(args)
+    if args.mode in ('train', 'train_test'):
+        train(args)
+    if args.mode in ('test', 'train_test'):
+        test(args)

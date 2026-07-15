@@ -2,6 +2,9 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import torch.nn as nn
+from PIL import Image
+
+from datasets.CD_dataset import get_label_path
 
 def cross_entropy(input, target, weight=None, reduction='mean',ignore_index=255):
     """
@@ -19,6 +22,89 @@ def cross_entropy(input, target, weight=None, reduction='mean',ignore_index=255)
 
     return F.cross_entropy(input=input, target=target, weight=weight,
                            ignore_index=ignore_index, reduction=reduction)
+
+
+def get_dataset_class_counts(dataset, n_classes):
+    """Count label pixels from a dataset split without applying augmentation."""
+    counts = np.zeros(n_classes, dtype=np.int64)
+    for name in dataset.img_name_list:
+        label_path = get_label_path(dataset.root_dir, str(name))
+        with Image.open(label_path) as image:
+            label = np.asarray(image, dtype=np.uint8)
+        if label.ndim == 3:
+            label = label[..., 0]
+        if dataset.label_transform == 'norm':
+            label = label // 255
+        valid = (label >= 0) & (label < n_classes)
+        counts += np.bincount(
+            label[valid].astype(np.int64), minlength=n_classes
+        )[:n_classes]
+    if np.any(counts == 0):
+        raise ValueError(f'every class must occur in the training split: {counts.tolist()}')
+    return counts
+
+
+def sqrt_inverse_frequency_weights(class_counts):
+    """Compute moderate inverse-frequency weights normalized to mean one."""
+    counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    if counts.ndim != 1 or torch.any(counts <= 0):
+        raise ValueError(f'class counts must be a positive vector: {class_counts}')
+    frequencies = counts / counts.sum()
+    weights = torch.rsqrt(frequencies)
+    return weights / weights.mean()
+
+
+class WeightedCrossEntropyDiceLoss(nn.Module):
+    """Equal mixture of weighted CE and soft Dice for the change class."""
+
+    def __init__(self, class_weights, ce_weight=0.5, dice_weight=0.5,
+                 smooth=1.0, ignore_index=255):
+        super().__init__()
+        if ce_weight < 0 or dice_weight < 0 or ce_weight + dice_weight <= 0:
+            raise ValueError('CE and Dice weights must be non-negative and not both zero')
+        self.register_buffer(
+            'class_weights', torch.as_tensor(class_weights, dtype=torch.float32)
+        )
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, target):
+        if target.dim() == 4:
+            target = torch.squeeze(target, dim=1)
+        target = target.long()
+        if logits.shape[-2:] != target.shape[-2:]:
+            logits = F.interpolate(
+                logits,
+                size=target.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        ce_loss = F.cross_entropy(
+            logits,
+            target,
+            weight=self.class_weights,
+            ignore_index=self.ignore_index,
+        )
+
+        valid = target != self.ignore_index
+        foreground = (target == 1).float()
+        foreground_probability = F.softmax(logits, dim=1)[:, 1]
+        valid_float = valid.float()
+        reduce_dims = (1, 2)
+        intersection = (
+            foreground_probability * foreground * valid_float
+        ).sum(dim=reduce_dims)
+        denominator = (
+            (foreground_probability + foreground) * valid_float
+        ).sum(dim=reduce_dims)
+        dice = (2.0 * intersection + self.smooth) / (
+            denominator + self.smooth
+        )
+        dice_loss = 1.0 - dice.mean()
+        return self.ce_weight * ce_loss + self.dice_weight * dice_loss
 
 #Focal Loss
 def get_alpha(supervised_loader):

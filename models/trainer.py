@@ -76,6 +76,7 @@ class CDTrainer():
         self.epoch_acc = 0
         self.best_val_acc = 0.0
         self.best_epoch_id = 0
+        self.selection_metric = getattr(args, 'selection_metric', 'mf1')
         self.epoch_to_start = 0
         self.max_num_epochs = args.max_epochs
 
@@ -94,6 +95,8 @@ class CDTrainer():
         self.vis_dir = args.vis_dir
 
         self.shuffle_AB = args.shuffle_AB
+        self.class_counts = None
+        self.class_weights = None
 
         # define the loss functions
         self.multi_scale_train = args.multi_scale_train
@@ -101,6 +104,24 @@ class CDTrainer():
         self.weights = tuple(args.multi_pred_weights)
         if args.loss == 'ce':
             self._pxl_loss = cross_entropy
+        elif args.loss == 'ce_dice':
+            self.class_counts = losses.get_dataset_class_counts(
+                dataloaders['train'].dataset, args.n_class
+            )
+            weights = losses.sqrt_inverse_frequency_weights(self.class_counts)
+            self.class_weights = weights.tolist()
+            self._pxl_loss = losses.WeightedCrossEntropyDiceLoss(
+                class_weights=weights,
+                ce_weight=0.5,
+                dice_weight=0.5,
+            ).to(self.device)
+            self.logger.write(
+                '训练集类别像素计数: %s\n' % self.class_counts.tolist()
+            )
+            self.logger.write(
+                '平方根逆频率类别权重: %s\n' %
+                [round(value, 6) for value in self.class_weights]
+            )
         elif args.loss == 'bce':
             self._pxl_loss = losses.binary_ce
         elif args.loss == 'fl':
@@ -195,6 +216,10 @@ class CDTrainer():
             'model_G_state_dict': self.net_G.state_dict(),
             'optimizer_G_state_dict': self.optimizer_G.state_dict(),
             'exp_lr_scheduler_G_state_dict': self.exp_lr_scheduler_G.state_dict(),
+            'loss_name': self.args.loss,
+            'class_counts': self.class_counts,
+            'class_weights': self.class_weights,
+            'selection_metric': self.selection_metric,
         }, os.path.join(self.checkpoint_dir, ckpt_name))
 
     def _update_lr_schedulers(self):
@@ -208,7 +233,12 @@ class CDTrainer():
         G_pred = self.G_final_pred.detach()
 
         if target.shape[2:] != G_pred.shape[2:]:
-            G_pred = F.interpolate(G_pred, size=[256, 256], mode='bilinear')
+            G_pred = F.interpolate(
+                G_pred,
+                size=target.shape[2:],
+                mode='bilinear',
+                align_corners=False,
+            )
 
         G_pred = torch.argmax(G_pred, dim=1)
 
@@ -249,7 +279,12 @@ class CDTrainer():
                 w, h = vis_gt.shape[1], vis_gt.shape[0]
                 vis_pred = cv2.resize(vis_pred, (w, h), interpolation = cv2.INTER_NEAREST)
             
-            vis = np.concatenate([vis_input, vis_input2, vis_pred, vis_gt], axis=0)
+            vis = utils.stack_labeled_visualizations([
+                ('Time 1 image (A)', vis_input),
+                ('Time 2 image (B)', vis_input2),
+                ('Prediction (Pred)', vis_pred),
+                ('Ground truth (GT)', vis_gt),
+            ])
             vis = np.clip(vis, a_min=0.0, a_max=1.0)
             file_name = os.path.join(
                 self.vis_dir, 'istrain_'+str(self.is_training)+'_'+
@@ -258,9 +293,15 @@ class CDTrainer():
 
     def _collect_epoch_states(self):
         scores = self.running_metric.get_scores()
-        self.epoch_acc = scores['mf1']
-        self.logger.write('训练阶段: %s. 第 %d / %d 轮, 当前轮mF1 = %.5f\n' %
-              (self.is_training, self.epoch_id, self.max_num_epochs-1, self.epoch_acc))
+        if self.selection_metric not in scores:
+            raise KeyError(
+                'unknown selection metric %s; available metrics: %s' %
+                (self.selection_metric, sorted(scores))
+            )
+        self.epoch_acc = scores[self.selection_metric]
+        self.logger.write('训练阶段: %s. 第 %d / %d 轮, 当前轮%s = %.5f\n' %
+              (self.is_training, self.epoch_id, self.max_num_epochs-1,
+               self.selection_metric, self.epoch_acc))
         message = ''
         for k, v in scores.items():
             message += '%s: %.5f ' % (k, v)
@@ -283,7 +324,8 @@ class CDTrainer():
         self.logger.write('\n')
 
         # update the best model (based on eval acc)
-        if self.epoch_acc > self.best_val_acc:
+        best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_ckpt.pt')
+        if not os.path.exists(best_checkpoint_path) or self.epoch_acc > self.best_val_acc:
             self.best_val_acc = self.epoch_acc
             self.best_epoch_id = self.epoch_id
             self._save_checkpoint(ckpt_name='best_ckpt.pt')
