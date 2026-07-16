@@ -30,8 +30,15 @@ RATE_FIELDS = (
 CSV_FIELDS = (
     "domain",
     "scene",
+    "split",
+    "region_left",
+    "region_top",
+    "region_right",
+    "region_bottom",
     "width",
     "height",
+    "scene_width",
+    "scene_height",
     "tn",
     "fp",
     "fn",
@@ -156,23 +163,28 @@ def _save_overview(path, image_a, image_b, ground_truth, prediction):
 
 
 class SceneStitchEvaluator:
-    """Accumulate patch logits and reconstruct every held-out test scene."""
+    """Accumulate patch logits and reconstruct spatial regions from metadata."""
 
-    def __init__(self, metadata_path, output_dir, n_class=2):
+    def __init__(self, metadata_path, output_dir, n_class=2, split="test"):
         if n_class != 2:
             raise ValueError("scene-level SAR evaluation currently requires n_class=2")
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"unsupported metadata split: {split}")
 
         self.metadata_path = Path(metadata_path)
         self.output_dir = Path(output_dir)
+        self.split = split
         if not self.metadata_path.is_file():
             raise FileNotFoundError(f"metadata does not exist: {self.metadata_path}")
 
         with self.metadata_path.open(newline="", encoding="utf-8") as stream:
             rows = [
-                row for row in csv.DictReader(stream) if row.get("split") == "test"
+                row for row in csv.DictReader(stream) if row.get("split") == split
             ]
         if not rows:
-            raise ValueError(f"metadata has no test rows: {self.metadata_path}")
+            raise ValueError(
+                f"metadata has no {split} rows: {self.metadata_path}"
+            )
 
         required_fields = {
             "patch_name",
@@ -192,24 +204,53 @@ class SceneStitchEvaluator:
             )
 
         self.rows_by_name = {}
+        scene_rows = defaultdict(list)
         for row in rows:
             name = row["patch_name"]
             if name in self.rows_by_name:
-                raise ValueError(f"duplicate test patch in metadata: {name}")
+                raise ValueError(f"duplicate {split} patch in metadata: {name}")
             self.rows_by_name[name] = row
+            scene_rows[(row["domain"], row["scene"])].append(row)
+
+        self.scene_extents = {}
+        for key, rows_for_scene in scene_rows.items():
+            scene_sizes = {
+                (int(row["scene_width"]), int(row["scene_height"]))
+                for row in rows_for_scene
+            }
+            if len(scene_sizes) != 1:
+                raise ValueError(f"scene dimensions disagree in metadata: {key}")
+            scene_width, scene_height = next(iter(scene_sizes))
+            self.scene_extents[key] = {
+                "left": min(int(row["left"]) for row in rows_for_scene),
+                "top": min(int(row["top"]) for row in rows_for_scene),
+                "right": max(int(row["right"]) for row in rows_for_scene),
+                "bottom": max(int(row["bottom"]) for row in rows_for_scene),
+                "scene_width": scene_width,
+                "scene_height": scene_height,
+            }
 
         self.n_class = n_class
         self.buffers = {}
         self.seen_names = set()
 
     def _create_buffer(self, row):
-        width = int(row["scene_width"])
-        height = int(row["scene_height"])
+        key = (row["domain"], row["scene"])
+        extent = self.scene_extents[key]
+        width = extent["right"] - extent["left"]
+        height = extent["bottom"] - extent["top"]
         return {
             "domain": row["domain"],
             "scene": row["scene"],
+            "split": self.split,
+            "region_left": extent["left"],
+            "region_top": extent["top"],
+            "region_right": extent["right"],
+            "region_bottom": extent["bottom"],
             "width": width,
             "height": height,
+            "scene_width": extent["scene_width"],
+            "scene_height": extent["scene_height"],
             "probability_sum": np.zeros(
                 (self.n_class, height, width), dtype=np.float32
             ),
@@ -252,9 +293,11 @@ class SceneStitchEvaluator:
 
         for index, name in enumerate(names):
             if name not in self.rows_by_name:
-                raise KeyError(f"test patch is absent from metadata: {name}")
+                raise KeyError(f"{self.split} patch is absent from metadata: {name}")
             if name in self.seen_names:
-                raise ValueError(f"test patch was evaluated more than once: {name}")
+                raise ValueError(
+                    f"{self.split} patch was evaluated more than once: {name}"
+                )
 
             row = self.rows_by_name[name]
             key = (row["domain"], row["scene"])
@@ -275,12 +318,18 @@ class SceneStitchEvaluator:
             if image_a_values[index].shape != patch_shape:
                 raise ValueError(f"image size does not match metadata for {name}")
             if not (
-                0 <= left < right <= buffer["width"]
-                and 0 <= top < bottom <= buffer["height"]
+                0 <= left < right <= buffer["scene_width"]
+                and 0 <= top < bottom <= buffer["scene_height"]
+                and buffer["region_left"] <= left < right <= buffer["region_right"]
+                and buffer["region_top"] <= top < bottom <= buffer["region_bottom"]
             ):
                 raise ValueError(f"patch coordinates are outside the scene: {name}")
 
-            region = np.s_[top:bottom, left:right]
+            local_left = left - buffer["region_left"]
+            local_top = top - buffer["region_top"]
+            local_right = right - buffer["region_left"]
+            local_bottom = bottom - buffer["region_top"]
+            region = np.s_[local_top:local_bottom, local_left:local_right]
             existing_labels = buffer["ground_truth"][region]
             overlap = existing_labels >= 0
             if np.any(existing_labels[overlap] != label_values[index][overlap]):
@@ -327,15 +376,17 @@ class SceneStitchEvaluator:
             encoding="utf-8",
         )
 
-    def finalize(self):
+    def finalize(self, save_outputs=True):
         missing_names = sorted(set(self.rows_by_name) - self.seen_names)
         if missing_names:
             preview = ", ".join(missing_names[:5])
             raise ValueError(
-                f"{len(missing_names)} test patches were not evaluated; first: {preview}"
+                f"{len(missing_names)} {self.split} patches were not evaluated; "
+                f"first: {preview}"
             )
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if save_outputs:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
         scene_rows = []
         scene_confusions = {}
         for key in sorted(self.buffers):
@@ -358,20 +409,32 @@ class SceneStitchEvaluator:
                 {
                     "domain": buffer["domain"],
                     "scene": buffer["scene"],
+                    "split": buffer["split"],
+                    "region_left": buffer["region_left"],
+                    "region_top": buffer["region_top"],
+                    "region_right": buffer["region_right"],
+                    "region_bottom": buffer["region_bottom"],
                     "width": buffer["width"],
                     "height": buffer["height"],
+                    "scene_width": buffer["scene_width"],
+                    "scene_height": buffer["scene_height"],
                 }
             )
             scene_rows.append(metrics)
             scene_confusions[key] = confusion
-            self._save_scene(buffer, prediction, probabilities[1], metrics)
+            if save_outputs:
+                self._save_scene(buffer, prediction, probabilities[1], metrics)
 
-        with (self.output_dir / "scene_metrics.csv").open(
-            "w", encoding="utf-8", newline=""
-        ) as stream:
-            writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
-            writer.writeheader()
-            writer.writerows({field: row[field] for field in CSV_FIELDS} for row in scene_rows)
+        if save_outputs:
+            with (self.output_dir / "scene_metrics.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as stream:
+                writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
+                writer.writeheader()
+                writer.writerows(
+                    {field: row[field] for field in CSV_FIELDS}
+                    for row in scene_rows
+                )
 
         domain_rows = defaultdict(list)
         domain_confusions = defaultdict(lambda: np.zeros((2, 2), dtype=np.int64))
@@ -388,6 +451,9 @@ class SceneStitchEvaluator:
                 "scene_macro_mean": _mean_rates(domain_rows[domain]),
                 "pixel_global": binary_metrics(domain_confusions[domain]),
             }
+        domain_macro_mean = _mean_rates(
+            [domain_summary["scene_macro_mean"] for domain_summary in domains.values()]
+        )
 
         global_confusion = sum(
             scene_confusions.values(), np.zeros((2, 2), dtype=np.int64)
@@ -395,14 +461,17 @@ class SceneStitchEvaluator:
         summary = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "metadata_path": str(self.metadata_path),
+            "split": self.split,
             "scene_count": len(scene_rows),
             "patch_count": len(self.seen_names),
             "scene_macro_mean": _mean_rates(scene_rows),
+            "domain_macro_mean": domain_macro_mean,
             "pixel_global": binary_metrics(global_confusion),
             "domains": domains,
         }
-        (self.output_dir / "summary.json").write_text(
-            json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        if save_outputs:
+            (self.output_dir / "summary.json").write_text(
+                json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
         return summary

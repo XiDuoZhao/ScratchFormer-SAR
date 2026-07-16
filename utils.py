@@ -1,3 +1,6 @@
+import os
+import random
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -6,6 +9,30 @@ import cv2
 
 import data_config
 from datasets.CD_dataset import CDDataset
+
+
+def set_random_seed(seed):
+    """Seed Python, NumPy, PyTorch, and deterministic cuDNN behavior."""
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def seeded_generator(seed):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
 
 
 def resolve_data_config(data_name, data_root=''):
@@ -17,7 +44,8 @@ def resolve_data_config(data_name, data_root=''):
 
 
 def get_loader(data_name, img_size=256, batch_size=8, split='test',
-               is_train=False, dataset='CDDataset', img_mode='RGB', data_root=''):
+               is_train=False, dataset='CDDataset', img_mode='RGB', data_root='',
+               num_workers=4, seed=0):
     dataConfig = resolve_data_config(data_name, data_root=data_root)
     root_dir = dataConfig.root_dir
     label_transform = dataConfig.label_transform
@@ -37,7 +65,9 @@ def get_loader(data_name, img_size=256, batch_size=8, split='test',
 
     shuffle = is_train
     dataloader = DataLoader(data_set, batch_size=batch_size,
-                                 shuffle=shuffle, num_workers=4)
+                                 shuffle=shuffle, num_workers=num_workers,
+                                 worker_init_fn=seed_worker,
+                                 generator=seeded_generator(seed))
 
     return dataloader
 
@@ -72,10 +102,25 @@ def get_loaders(args):
             'Wrong dataset name %s (choose one from [CDDataset,])'
             % args.dataset)
 
-    datasets = {'train': training_set, 'val': val_set}
-    dataloaders = {x: DataLoader(datasets[x], batch_size=args.batch_size,
-                                 shuffle=True, num_workers=args.num_workers)
-                   for x in ['train', 'val']}
+    seed = getattr(args, 'seed', 0)
+    dataloaders = {
+        'train': DataLoader(
+            training_set,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            worker_init_fn=seed_worker,
+            generator=seeded_generator(seed),
+        ),
+        'val': DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            worker_init_fn=seed_worker,
+            generator=seeded_generator(seed + 1),
+        ),
+    }
 
     return dataloaders
 

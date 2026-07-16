@@ -105,6 +105,65 @@ class SceneStitchEvaluatorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "test patches were not evaluated"):
             evaluator.finalize()
 
+    def test_reconstructs_offset_validation_region(self):
+        metadata_path = self.root / "validation_metadata.csv"
+        fieldnames = (
+            "patch_name", "split", "domain", "scene", "left", "top",
+            "right", "bottom", "scene_width", "scene_height",
+        )
+        with metadata_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            for index, (left, top) in enumerate(self.positions):
+                writer.writerow(
+                    {
+                        "patch_name": f"val_{index}.png",
+                        "split": "val",
+                        "domain": "Synthetic",
+                        "scene": "OffsetScene",
+                        "left": left + 2,
+                        "top": top + 3,
+                        "right": left + 5,
+                        "bottom": top + 6,
+                        "scene_width": 8,
+                        "scene_height": 9,
+                    }
+                )
+
+        region = np.array(
+            [[0, 0, 0, 0], [0, 1, 1, 0],
+             [0, 1, 1, 0], [0, 0, 0, 0]],
+            dtype=np.uint8,
+        )
+        evaluator = SceneStitchEvaluator(
+            metadata_path, self.output_dir, split="val"
+        )
+        for index, (left, top) in enumerate(self.positions):
+            patch = region[top:top + 3, left:left + 3]
+            logits = np.full((1, 2, 3, 3), -6.0, dtype=np.float32)
+            logits[0, 0][patch == 0] = 6.0
+            logits[0, 1][patch == 1] = 6.0
+            evaluator.add_batch(
+                names=[f"val_{index}.png"],
+                logits=torch.from_numpy(logits),
+                images_a=self._normalized_tensor(patch * 100),
+                images_b=self._normalized_tensor(patch * 100),
+                labels=torch.from_numpy(patch)[None, None],
+            )
+
+        summary = evaluator.finalize()
+        metrics = summary["pixel_global"]
+        output = np.asarray(
+            Image.open(
+                self.output_dir / "Synthetic" / "OffsetScene" / "prediction.png"
+            )
+        )
+
+        self.assertEqual(summary["split"], "val")
+        self.assertEqual(output.shape, (4, 4))
+        np.testing.assert_array_equal(output, region * 255)
+        self.assertAlmostEqual(metrics["f1"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import random
 
 import utils
 from models.networks import *
@@ -9,6 +10,7 @@ import torch
 import torch.optim as optim
 import numpy as np
 from misc.metric_tool import ConfuseMatrixMeter
+from misc.scene_evaluation import SceneStitchEvaluator
 from models.losses import cross_entropy
 import models.losses as losses
 from models.losses import get_alpha, softmax_helper, FocalLoss, mIoULoss, mmIoULoss
@@ -22,6 +24,17 @@ from utils import de_norm
 from tqdm import tqdm
 from datetime import datetime
 import time
+
+
+SCENE_SELECTION_METRICS = {
+    'acc': 'accuracy',
+    'miou': 'miou',
+    'mf1': 'mf1',
+    'iou_1': 'iou',
+    'F1_1': 'f1',
+    'precision_1': 'precision',
+    'recall_1': 'recall',
+}
 
 class CDTrainer():
 
@@ -97,6 +110,32 @@ class CDTrainer():
         self.shuffle_AB = args.shuffle_AB
         self.class_counts = None
         self.class_weights = None
+        self.validation_scene_evaluator = None
+        self.validation_scene_summary = None
+        metadata_path = getattr(args, 'scene_metadata', '')
+        if not metadata_path:
+            metadata_path = os.path.join(
+                dataloaders['val'].dataset.root_dir, 'metadata.csv'
+            )
+        requested_val_mode = getattr(args, 'val_eval_mode', 'auto')
+        metadata_available = os.path.isfile(metadata_path)
+        if requested_val_mode == 'scene' and not metadata_available:
+            raise FileNotFoundError(
+                'scene validation requires metadata.csv: %s' % metadata_path
+            )
+        if requested_val_mode == 'patch':
+            self.val_eval_mode = 'patch'
+        else:
+            self.val_eval_mode = 'scene' if metadata_available else 'patch'
+        self.validation_metadata_path = metadata_path
+        self.validation_scene_output = os.path.join(
+            self.checkpoint_dir, 'validation_scene_evaluation'
+        )
+        self.logger.write('验证评估模式: %s\n' % self.val_eval_mode)
+        if self.val_eval_mode == 'scene':
+            self.logger.write(
+                '验证坐标元数据: %s\n' % self.validation_metadata_path
+            )
 
         # define the loss functions
         self.multi_scale_train = args.multi_scale_train
@@ -156,6 +195,38 @@ class CDTrainer():
             os.mkdir(self.vis_dir)
 
 
+    def _capture_rng_state(self):
+        state = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'train_generator': self.dataloaders['train'].generator.get_state(),
+            'val_generator': self.dataloaders['val'].generator.get_state(),
+        }
+        if torch.cuda.is_available():
+            state['cuda'] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_rng_state(self, checkpoint):
+        state = checkpoint.get('rng_state')
+        if state is None:
+            self.logger.write('检查点不包含随机数状态，继续使用命令行种子。\n')
+            return
+        random.setstate(state['python'])
+        np.random.set_state(state['numpy'])
+        torch.set_rng_state(state['torch'].cpu())
+        self.dataloaders['train'].generator.set_state(
+            state['train_generator'].cpu()
+        )
+        self.dataloaders['val'].generator.set_state(
+            state['val_generator'].cpu()
+        )
+        if torch.cuda.is_available() and 'cuda' in state:
+            torch.cuda.set_rng_state_all(
+                [cuda_state.cpu() for cuda_state in state['cuda']]
+            )
+        self.logger.write('已恢复检查点中的随机数与DataLoader状态。\n')
+
     def _load_checkpoint(self, ckpt_name='last_ckpt.pt'):
         print("\n")
         
@@ -177,6 +248,7 @@ class CDTrainer():
             self.epoch_to_start = checkpoint['epoch_id'] + 1
             self.best_val_acc = checkpoint['best_val_acc']
             self.best_epoch_id = checkpoint['best_epoch_id']
+            self._restore_rng_state(checkpoint)
 
             self.total_steps = (self.max_num_epochs - self.epoch_to_start)*self.steps_per_epoch
 
@@ -220,6 +292,10 @@ class CDTrainer():
             'class_counts': self.class_counts,
             'class_weights': self.class_weights,
             'selection_metric': self.selection_metric,
+            'seed': getattr(self.args, 'seed', 0),
+            'val_eval_mode': self.val_eval_mode,
+            'validation_scene_summary': self.validation_scene_summary,
+            'rng_state': self._capture_rng_state(),
         }, os.path.join(self.checkpoint_dir, ckpt_name))
 
     def _update_lr_schedulers(self):
@@ -245,9 +321,62 @@ class CDTrainer():
         current_score = self.running_metric.update_cm(pr=G_pred.cpu().numpy(), gt=target.cpu().numpy())
         return current_score
 
+    def _start_validation_scene_evaluation(self):
+        self.validation_scene_summary = None
+        if self.val_eval_mode != 'scene':
+            self.validation_scene_evaluator = None
+            return
+        self.validation_scene_evaluator = SceneStitchEvaluator(
+            metadata_path=self.validation_metadata_path,
+            output_dir=self.validation_scene_output,
+            n_class=self.n_class,
+            split='val',
+        )
+
+    def _collect_validation_scene_batch(self):
+        if self.is_training or self.validation_scene_evaluator is None:
+            return
+        logits = self.G_final_pred.detach()
+        target_size = self.batch['L'].shape[-2:]
+        if logits.shape[-2:] != target_size:
+            logits = F.interpolate(
+                logits,
+                size=target_size,
+                mode='bilinear',
+                align_corners=False,
+            )
+        self.validation_scene_evaluator.add_batch(
+            names=self.batch['name'],
+            logits=logits,
+            images_a=self.batch['A'],
+            images_b=self.batch['B'],
+            labels=self.batch['L'],
+        )
+
+    def _finish_validation_scene_evaluation(self):
+        if self.validation_scene_evaluator is None:
+            return None, None
+        self.validation_scene_summary = self.validation_scene_evaluator.finalize(
+            save_outputs=False
+        )
+        metric_name = SCENE_SELECTION_METRICS.get(self.selection_metric)
+        if metric_name is None:
+            raise KeyError(
+                'selection metric %s is unavailable for scene validation; '
+                'supported metrics: %s' %
+                (self.selection_metric, sorted(SCENE_SELECTION_METRICS))
+            )
+        macro = self.validation_scene_summary['domain_macro_mean']
+        self.logger.write(
+            '验证区域数据域宏平均: F1=%.5f IoU=%.5f Kappa=%.5f MCC=%.5f\n'
+            % (macro['f1'], macro['iou'], macro['kappa'], macro['mcc'])
+        )
+        return macro[metric_name], 'domain_macro_%s' % metric_name
+
     def _collect_running_batch_states(self):
 
         running_acc = self._update_metric()
+        self._collect_validation_scene_batch()
 
         m = len(self.dataloaders['train'])
         if self.is_training is False:
@@ -291,22 +420,27 @@ class CDTrainer():
                               str(self.epoch_id)+'_'+str(self.batch_id)+'.jpg')
             plt.imsave(file_name, vis)
 
-    def _collect_epoch_states(self):
+    def _collect_epoch_states(self, selection_score=None, selection_name=None):
         scores = self.running_metric.get_scores()
-        if self.selection_metric not in scores:
-            raise KeyError(
-                'unknown selection metric %s; available metrics: %s' %
-                (self.selection_metric, sorted(scores))
-            )
-        self.epoch_acc = scores[self.selection_metric]
+        if selection_score is None:
+            if self.selection_metric not in scores:
+                raise KeyError(
+                    'unknown selection metric %s; available metrics: %s' %
+                    (self.selection_metric, sorted(scores))
+                )
+            self.epoch_acc = scores[self.selection_metric]
+            selection_name = self.selection_metric
+        else:
+            self.epoch_acc = selection_score
         self.logger.write('训练阶段: %s. 第 %d / %d 轮, 当前轮%s = %.5f\n' %
               (self.is_training, self.epoch_id, self.max_num_epochs-1,
-               self.selection_metric, self.epoch_acc))
+               selection_name, self.epoch_acc))
         message = ''
         for k, v in scores.items():
             message += '%s: %.5f ' % (k, v)
         self.logger.write(message+'\n')
         self.logger.write('\n')
+        return scores
 
     def _format_duration(self, seconds):
         seconds = int(seconds)
@@ -317,18 +451,24 @@ class CDTrainer():
 
     def _update_checkpoints(self):
 
-        # save current model
+        best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_ckpt.pt')
+        is_best = (
+            not os.path.exists(best_checkpoint_path)
+            or self.epoch_acc > self.best_val_acc
+        )
+        if is_best:
+            self.best_val_acc = self.epoch_acc
+            self.best_epoch_id = self.epoch_id
+
         self._save_checkpoint(ckpt_name='last_ckpt.pt')
         self.logger.write('最新模型已更新。当前轮精度=%.4f, 历史最佳精度=%.4f (出现在第 %d 轮)\n'
               % (self.epoch_acc, self.best_val_acc, self.best_epoch_id))
         self.logger.write('\n')
 
-        # update the best model (based on eval acc)
-        best_checkpoint_path = os.path.join(self.checkpoint_dir, 'best_ckpt.pt')
-        if not os.path.exists(best_checkpoint_path) or self.epoch_acc > self.best_val_acc:
-            self.best_val_acc = self.epoch_acc
-            self.best_epoch_id = self.epoch_id
+        if is_best:
             self._save_checkpoint(ckpt_name='best_ckpt.pt')
+            if self.validation_scene_evaluator is not None:
+                self.validation_scene_evaluator.finalize(save_outputs=True)
             self.logger.write('*' * 10 + ' 最佳模型已更新！\n')
             self.logger.write('\n')
 
@@ -422,6 +562,7 @@ class CDTrainer():
             self._clear_cache()
             self.is_training = False
             self.net_G.eval()
+            self._start_validation_scene_evaluation()
 
             # Iterate over data.
             for self.batch_id, batch in enumerate(self.dataloaders['val'], 0):
@@ -429,7 +570,13 @@ class CDTrainer():
                     self._forward_pass(batch)
                 self._collect_running_batch_states()
             eval_epoch_duration = time.time() - eval_epoch_start_time
-            self._collect_epoch_states()
+            selection_score, selection_name = (
+                self._finish_validation_scene_evaluation()
+            )
+            self._collect_epoch_states(
+                selection_score=selection_score,
+                selection_name=selection_name,
+            )
             self.logger.write('本轮验证耗时: %s\n\n' % self._format_duration(eval_epoch_duration))
 
             ########### Update_Checkpoints ###########

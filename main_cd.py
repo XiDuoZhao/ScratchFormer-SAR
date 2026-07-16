@@ -20,7 +20,10 @@ def test(args):
     dataloader = utils.get_loader(args.data_name, img_size=args.img_size,
                                   batch_size=args.batch_size, is_train=False,
                                   # 测试阶段也需要沿用训练时的读图模式，确保 SAR 以单通道方式送入网络
-                                  split='test', img_mode=args.img_mode, data_root=args.data_root)
+                                  split='test', img_mode=args.img_mode,
+                                  data_root=args.data_root,
+                                  num_workers=args.num_workers,
+                                  seed=args.seed)
     model = CDEvaluator(args=args, dataloader=dataloader)
 
     model.eval_models(checkpoint_name=args.checkpoint_name)
@@ -45,6 +48,7 @@ if __name__ == '__main__':
 
     # data
     parser.add_argument('--num_workers', default=8, type=int)
+    parser.add_argument('--seed', default=0, type=int, help='reproducible random seed')
     parser.add_argument('--dataset', default='CDDataset', type=str)
     parser.add_argument('--data_name', default='CDD', type=str)
     parser.add_argument('--data_root', default='', type=str, help='optional custom dataset root directory')
@@ -71,6 +75,12 @@ if __name__ == '__main__':
         default='',
         type=str,
         help='scene evaluation output; defaults to checkpoint scene_evaluation directory',
+    )
+    parser.add_argument(
+        '--val_eval_mode',
+        default='auto',
+        choices=['auto', 'patch', 'scene'],
+        help='auto uses coordinate-aware scene validation when metadata.csv exists',
     )
 
     # model
@@ -105,6 +115,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr_decay_iters', default=[100], type=int)
     
     args = parser.parse_args()
+    utils.set_random_seed(args.seed)
     utils.get_device(args)
     print(args.gpu_ids)
     
